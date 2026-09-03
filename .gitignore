@@ -1,0 +1,18 @@
+# Environment
+.env
+venv/
+.venv/
+
+# Runtime artifacts
+database/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+
+# Tests
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
