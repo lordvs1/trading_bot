@@ -36,7 +36,14 @@ class TestFormatting:
         assert "Стоп-лосс" in text
         assert "Тейк-профит 1" in text
         assert "Тейк-профит 2" in text
-        assert "Трейлинг" in text
+
+    def test_trade_signal_single_tp(self, disabled_notifier):
+        text = disabled_notifier.format_trade_signal(
+            side="LONG", symbol="BTCUSDT", price=60000.0, quantity=0.0015,
+            sl=51000.0, tp=[66000.0],
+        )
+        assert "Тейк-профит 1" in text
+        assert "Тейк-профит 2" not in text
 
     def test_trade_exit_contains_reason(self, disabled_notifier):
         text = disabled_notifier.format_trade_exit(

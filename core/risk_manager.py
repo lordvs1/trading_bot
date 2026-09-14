@@ -91,6 +91,51 @@ def calculate_stop_loss(entry_price: float, side: str, stop_loss_percent: float)
     raise ValueError(f"Unknown side: {side}")
 
 
+def size_with_min_lot(
+    balance_usdt: float,
+    entry_price: float,
+    sl_price: float,
+    leverage: int,
+    risk_percent: float,
+    qty_step: float,
+    min_qty: float,
+    risk_hard_cap: float,
+) -> tuple:
+    """Return ``(quantity, topped_up)`` honouring the exchange minimum lot.
+
+    The normal risk-based size is floored to ``qty_step``. If it falls below the
+    exchange ``min_qty`` the position is topped up to the minimum lot *only* when
+    the resulting actual risk stays within ``risk_hard_cap``; otherwise it is
+    skipped (returns ``(0.0, False)``). The notional is capped by available
+    margin (``balance * leverage``).
+    """
+    if balance_usdt <= 0 or entry_price <= 0 or qty_step <= 0:
+        return 0.0, False
+    stop_loss_pct = abs(entry_price - sl_price) / entry_price
+    if stop_loss_pct <= 0:
+        return 0.0, False
+
+    raw = balance_usdt * risk_percent / stop_loss_pct / entry_price
+    qty = round(math.floor(raw / qty_step) * qty_step, 12)
+    topped_up = False
+
+    if qty < min_qty:
+        candidate = round(math.ceil(min_qty / qty_step) * qty_step, 12)
+        implied_risk = candidate * stop_loss_pct * entry_price / balance_usdt
+        if implied_risk > risk_hard_cap:
+            return 0.0, False
+        qty = candidate
+        topped_up = True
+
+    max_notional = balance_usdt * leverage
+    if qty * entry_price > max_notional:
+        qty = round(math.floor((max_notional / entry_price) / qty_step) * qty_step, 12)
+        if qty < min_qty:
+            return 0.0, False
+
+    return qty, topped_up
+
+
 def calculate_take_profit_levels(entry_price: float, side: str) -> list[float]:
     """Return [TP1, TP2] prices for the two partial exits."""
     side = side.upper()
@@ -135,12 +180,24 @@ def calculate_trailing_stop(
 
 
 class RiskManager:
-    """Facade exposing the risk functions as an object interface.
+    """Object interface over the risk functions with configurable defaults.
 
-    The functions above hold no state, so this class simply delegates to them.
-    It exists so the bot's wiring reads naturally (``risk.calculate_*``) and to
-    match the module contract described in the specification.
+    Holds the take-profit and trailing-stop parameters so the backtester can
+    sweep them, while ``calculate_position_size`` / ``calculate_stop_loss``
+    remain stateless (their parameters are always passed in).
     """
+
+    def __init__(
+        self,
+        tp1_percent: float = TP1_PERCENT,
+        tp2_percent: float = TP2_PERCENT,
+        trailing_activation: float = ACTIVATION_PERCENT,
+        trailing_step: float = TRAILING_STEP,
+    ):
+        self.tp1_percent = tp1_percent
+        self.tp2_percent = tp2_percent
+        self.trailing_activation = trailing_activation
+        self.trailing_step = trailing_step
 
     def calculate_position_size(
         self, balance_usdt, entry_price, stop_loss_percent, leverage, risk_percent
@@ -152,11 +209,31 @@ class RiskManager:
     def round_quantity(self, quantity, qty_step, min_qty=0.0, max_qty=None) -> float:
         return round_quantity(quantity, qty_step, min_qty, max_qty)
 
+    def size_with_min_lot(
+        self, balance_usdt, entry_price, sl_price, leverage, risk_percent,
+        qty_step, min_qty, risk_hard_cap,
+    ):
+        return size_with_min_lot(
+            balance_usdt, entry_price, sl_price, leverage, risk_percent,
+            qty_step, min_qty, risk_hard_cap,
+        )
+
     def calculate_stop_loss(self, entry_price, side, stop_loss_percent) -> float:
         return calculate_stop_loss(entry_price, side, stop_loss_percent)
 
     def calculate_take_profit_levels(self, entry_price, side) -> list[float]:
-        return calculate_take_profit_levels(entry_price, side)
+        side = side.upper()
+        if side == "LONG":
+            return [
+                entry_price * (1 + self.tp1_percent),
+                entry_price * (1 + self.tp2_percent),
+            ]
+        if side == "SHORT":
+            return [
+                entry_price * (1 - self.tp1_percent),
+                entry_price * (1 - self.tp2_percent),
+            ]
+        raise ValueError(f"Unknown side: {side}")
 
     def calculate_trailing_stop(
         self,
@@ -164,14 +241,14 @@ class RiskManager:
         current_price,
         highest_price,
         side,
-        activation_percent=ACTIVATION_PERCENT,
-        trailing_step=TRAILING_STEP,
+        activation_percent=None,
+        trailing_step=None,
     ):
         return calculate_trailing_stop(
             entry_price,
             current_price,
             highest_price,
             side,
-            activation_percent,
-            trailing_step,
+            activation_percent if activation_percent is not None else self.trailing_activation,
+            trailing_step if trailing_step is not None else self.trailing_step,
         )

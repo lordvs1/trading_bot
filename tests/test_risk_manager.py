@@ -8,6 +8,7 @@ from core.risk_manager import (
     calculate_take_profit_levels,
     calculate_trailing_stop,
     round_quantity,
+    size_with_min_lot,
 )
 
 
@@ -109,3 +110,33 @@ class TestRoundQuantity:
 
     def test_returns_zero_when_below_min(self):
         assert round_quantity(0.0002, 0.0001, min_qty=0.001) == 0.0
+
+
+class TestSizeWithMinLot:
+    def test_normal_size_above_min(self):
+        # stop 5%, risk 1% -> notional 200 -> qty 2.0 (above min 0.001)
+        qty, topped = size_with_min_lot(1000, 100, 95, 3, 0.01, 0.001, 0.001, 0.03)
+        assert qty == pytest.approx(2.0)
+        assert topped is False
+
+    def test_topup_to_min_lot_within_cap(self):
+        # raw qty 0.2 < min 0.5; implied risk of min lot = 0.025 <= 0.03 -> top up
+        qty, topped = size_with_min_lot(100, 100, 95, 3, 0.01, 0.1, 0.5, 0.03)
+        assert qty == pytest.approx(0.5)
+        assert topped is True
+
+    def test_skip_when_topup_exceeds_cap(self):
+        # min lot 5.0 implies risk 0.25 > cap 0.03 -> skip
+        qty, topped = size_with_min_lot(100, 100, 95, 3, 0.01, 0.1, 5.0, 0.03)
+        assert qty == 0.0
+        assert topped is False
+
+    def test_margin_cap_applies(self):
+        # risk 100% would want a huge qty; margin cap (balance*leverage) limits it
+        qty, _ = size_with_min_lot(100, 100, 99.99, 2, 1.0, 0.001, 0.001, 1.0)
+        assert qty * 100 <= 100 * 2 + 1e-6
+
+    def test_zero_stop_returns_zero(self):
+        qty, topped = size_with_min_lot(100, 100, 100, 3, 0.01, 0.001, 0.001, 0.03)
+        assert qty == 0.0
+        assert topped is False

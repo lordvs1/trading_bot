@@ -1,8 +1,9 @@
 import pandas as pd
 import pytest
+from pybit.exceptions import FailedRequestError, InvalidRequestError
 
 from core import bybit_client
-from core.bybit_client import BybitClient, InsufficientFundsError
+from core.bybit_client import BybitClient, BybitClientError, InsufficientFundsError
 
 
 class FakeSession:
@@ -165,3 +166,24 @@ class TestFundingAndPing:
     def test_ping_false(self, client, fake):
         fake.server_time_ok = False
         assert client.ping() is False
+
+
+class TestErrorWrapping:
+    def test_http_401_raises_clear_bybit_client_error(self):
+        class AuthFailSession:
+            def get_positions(self, **kwargs):
+                raise FailedRequestError(None, "Unauthorized", 401, None, None)
+
+        c = BybitClient(api_key="k", api_secret="s", testnet=True, session=AuthFailSession())
+        with pytest.raises(BybitClientError) as exc:
+            c.get_open_positions()
+        assert "401" in str(exc.value)
+
+    def test_invalid_request_is_wrapped(self):
+        class BadSession:
+            def get_wallet_balance(self, **kwargs):
+                raise InvalidRequestError(None, "bad request", 400, None, None)
+
+        c = BybitClient(api_key="k", api_secret="s", testnet=True, session=BadSession())
+        with pytest.raises(BybitClientError):
+            c.get_balance()

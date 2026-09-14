@@ -82,3 +82,76 @@ class TestBaseUrl:
     def test_mainnet_url(self):
         cfg = Config(api_key="k", api_secret="s", testnet=False)
         assert cfg.base_url == "https://api.bybit.com"
+
+
+class TestTradeMode:
+    def test_default_is_live(self):
+        cfg = Config(api_key="k", api_secret="s")
+        assert cfg.trade_mode == "live"
+
+    def test_loaded_from_env(self, tmp_path):
+        env = _write_env(tmp_path, "TRADE_MODE=paper\n")
+        cfg = Config.load(env)
+        assert cfg.trade_mode == "paper"
+
+
+class TestInitialBalance:
+    def test_default(self):
+        assert Config().initial_balance == pytest.approx(1000.0)
+
+    def test_loaded_from_env(self, tmp_path):
+        env = _write_env(tmp_path, "INITIAL_BALANCE=250\n")
+        cfg = Config.load(env)
+        assert cfg.initial_balance == pytest.approx(250.0)
+
+
+class TestSizingConfig:
+    def test_defaults(self):
+        cfg = Config()
+        assert cfg.size_to_min_lot is False
+        assert cfg.risk_hard_cap == pytest.approx(0.03)
+
+    def test_loaded_from_env(self, tmp_path):
+        env = _write_env(tmp_path, "SIZE_TO_MIN_LOT=False\nRISK_HARD_CAP=0.05\n")
+        cfg = Config.load(env)
+        assert cfg.size_to_min_lot is False
+        assert cfg.risk_hard_cap == pytest.approx(0.05)
+
+
+class TestSymbolOverrides:
+    def test_params_and_risk_for(self, tmp_path):
+        env = _write_env(
+            tmp_path,
+            'SYMBOL_OVERRIDES={"BTCUSDT": {"max_stop_pct": 0.015, "max_risk_per_trade": 0.02}}\n',
+        )
+        cfg = Config.load(env)
+        assert cfg.params_for("BTCUSDT") == {"max_stop_pct": 0.015}
+        assert cfg.risk_for("BTCUSDT") == pytest.approx(0.02)
+        assert cfg.params_for("ETHUSDT") == {}
+        assert cfg.risk_for("ETHUSDT") == pytest.approx(cfg.max_risk_per_trade)
+
+    def test_invalid_json_is_ignored(self, tmp_path):
+        env = _write_env(tmp_path, "SYMBOL_OVERRIDES=not-json\n")
+        cfg = Config.load(env)
+        assert cfg.symbol_overrides == {}
+
+
+class TestValidate:
+    def test_live_requires_keys(self):
+        cfg = Config(api_key="", api_secret="")
+        with pytest.raises(ValueError):
+            cfg.validate()
+
+    def test_live_rejects_placeholder_keys(self):
+        cfg = Config(api_key="your_api_key_here", api_secret="s")
+        with pytest.raises(ValueError):
+            cfg.validate()
+
+    def test_paper_does_not_require_keys(self):
+        cfg = Config(api_key="", api_secret="", trade_mode="paper")
+        cfg.validate()
+
+    def test_unknown_trade_mode_rejected(self):
+        cfg = Config(api_key="k", api_secret="s", trade_mode="banana")
+        with pytest.raises(ValueError):
+            cfg.validate()

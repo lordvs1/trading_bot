@@ -6,5 +6,10 @@
         "apiKey": "{env:DEEPSEEK_API_KEY}"
       }
     }
+  },
+  "permission": {
+    "read": { ".env": "deny", ".env.*": "deny", "**/.env": "deny", "**/.env.*": "deny", ".env.example": "allow", "**/.env.example": "allow" },
+    "edit": { ".env": "deny", ".env.*": "deny", "**/.env": "deny", "**/.env.*": "deny", ".env.example": "allow", "**/.env.example": "allow" },
+    "grep": { ".env": "deny", ".env.*": "deny", "**/.env": "deny", "**/.env.*": "deny", ".env.example": "allow", "**/.env.example": "allow" }
   }
 }

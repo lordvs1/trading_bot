@@ -20,18 +20,15 @@ import time
 from datetime import date, datetime
 
 from config import Config
-from core.bybit_client import BybitClient, InsufficientFundsError
+from core.bybit_client import BybitClient, BybitClientError, InsufficientFundsError
 from core.logging_config import log_trade, setup_logging
+from core.paper_broker import PaperBroker
 from core.risk_manager import RiskManager
 from core.state_manager import StateManager
-from core.strategy import Strategy
 from notifier.notifier import TelegramNotifier
+from strategies import get_strategy
 
 logger = logging.getLogger("main")
-
-# Fraction of the ORIGINAL position closed at each take-profit level.
-PARTIAL_FRACTION = 0.30
-TRAILING_ACTIVATION_PERCENT = 15.0
 
 HEALTH_CHECK_INTERVAL = 30 * 60  # write "ALIVE" every 30 minutes
 
@@ -46,8 +43,14 @@ DAILY_REPORT_MINUTE = 50
 class TradingBot:
     def __init__(self, config: Config):
         self.config = config
-        self.client = BybitClient(config.api_key, config.api_secret, config.testnet)
-        self.strategy = Strategy()
+        self.client = self._make_client(config)
+        strategy_cls = get_strategy(config.strategy)
+        self.strategy = strategy_cls()
+        # Per-symbol strategy instances (honour SYMBOL_OVERRIDES).
+        self.strategies = {
+            sym: strategy_cls({**strategy_cls.default_params(), **config.params_for(sym)})
+            for sym in config.trade_symbols
+        }
         self.risk = RiskManager()
         self.state = StateManager("database/trades.db")
         self.notifier = TelegramNotifier(
@@ -58,6 +61,16 @@ class TradingBot:
         self.paused = False
         self._last_alive = time.time()
         self._last_report_date = None
+
+    def _strategy_for(self, symbol: str):
+        return self.strategies.get(symbol, self.strategy)
+
+    @staticmethod
+    def _make_client(config: Config):
+        if config.trade_mode == "paper":
+            logger.info("Running in PAPER mode (no real orders), balance=%.2f", config.initial_balance)
+            return PaperBroker(initial_balance=config.initial_balance)
+        return BybitClient(config.api_key, config.api_secret, config.testnet)
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -74,7 +87,19 @@ class TradingBot:
         self._install_signal_handlers()
         logger.info("Bot started (testnet=%s, symbols=%s)",
                     self.config.testnet, self.config.trade_symbols)
-        self._reconcile()  # restore/sync state on startup
+
+        try:
+            self._reconcile()  # restore/sync state on startup
+        except BybitClientError as exc:
+            logger.error("Startup reconciliation failed: %s", exc)
+            self.notifier.send_error(f"Ошибка при старте: {exc}")
+            self._shutdown()
+            return
+        except Exception as exc:  # noqa: BLE001 - fail with a clear message
+            logger.exception("Startup reconciliation failed")
+            self.notifier.send_error(f"Ошибка при старте: {exc}")
+            self._shutdown()
+            return
 
         while self.running:
             try:
@@ -197,11 +222,11 @@ class TradingBot:
         df_m15 = self.client.get_klines(symbol, "M15", 100)
         funding_rate = self.client.get_funding_rate(symbol)
 
-        signal_ = self.strategy.analyze(symbol, df_h1, df_m15, funding_rate)
-        if signal_ is None:
+        signal = self._strategy_for(symbol).analyze(df_h1, df_m15, funding_rate)
+        if signal is None:
             return
 
-        self._enter_position(symbol, signal_["side"], balance)
+        self._enter_position(symbol, signal, balance)
 
     def _find_position(self, symbol: str):
         return next(
@@ -209,30 +234,35 @@ class TradingBot:
             None,
         )
 
-    def _enter_position(self, symbol: str, side: str, balance: float) -> None:
+    def _enter_position(self, symbol: str, signal: dict, balance: float) -> None:
+        side = signal["side"]
+        sl = signal.get("sl")
+        tp = signal.get("tp")
         price = self.client.get_current_price(symbol)
-        stop_loss = self.risk.calculate_stop_loss(
-            price, side, self.config.stop_loss_percent
-        )
-        tp_levels = self.risk.calculate_take_profit_levels(price, side)
 
-        quantity = self.risk.calculate_position_size(
-            balance,
-            price,
-            self.config.stop_loss_percent,
-            self.config.leverage,
-            self.config.max_risk_per_trade,
-        )
         step = QTY_STEP.get(symbol, 0.001)
-        quantity = self.risk.round_quantity(quantity, step, MIN_QTY.get(symbol, step))
+        min_qty = MIN_QTY.get(symbol, step)
+        hard_cap = self.config.risk_hard_cap if self.config.size_to_min_lot else 0.0
+        quantity, topped = self.risk.size_with_min_lot(
+            balance, price, sl, self.config.leverage,
+            self.config.risk_for(symbol), step, min_qty, hard_cap,
+        )
         if quantity <= 0:
-            logger.warning("Skipping %s %s: rounded quantity is zero", side, symbol)
+            logger.warning(
+                "Skipping %s %s: size below minimum lot (budget %.2f)",
+                side, symbol, balance,
+            )
             return
+        if topped:
+            logger.info("Topped up %s %s to the minimum lot (qty=%s)", side, symbol, quantity)
 
         self.client.set_leverage(symbol, self.config.leverage)
-        self.client.place_order(symbol, side, quantity, "Market", stop_loss=stop_loss)
+        self.client.place_order(
+            symbol, side, quantity, "Market", stop_loss=sl, take_profit=tp
+        )
 
-        logger.info("Opened %s %s qty=%s @ %.2f (SL %.2f)", side, symbol, quantity, price, stop_loss)
+        logger.info("Opened %s %s qty=%s @ %.2f (SL %.2f, TP %s)",
+                    side, symbol, quantity, price, sl, tp)
         self.state.save_position(
             {
                 "symbol": symbol,
@@ -241,80 +271,46 @@ class TradingBot:
                 "quantity": quantity,
                 "leverage": self.config.leverage,
                 "position_size_usdt": quantity * price,
-                "stop_loss": stop_loss,
+                "stop_loss": sl,
             }
         )
         self.notifier.send_trade_signal(
-            side, symbol, price, quantity, stop_loss, tp_levels,
+            side, symbol, price, quantity, sl, [tp] if tp is not None else [],
             self.config.max_risk_per_trade,
         )
 
     def _manage_position(self, position: dict) -> None:
         symbol = position["symbol"]
-        side = position["side"]
-        entry = position["entry_price"]
         price = self.client.get_current_price(symbol)
 
-        # Track the favorable extreme for the trailing stop.
-        if side == "LONG":
-            pnl_pct = (price - entry) / entry * 100
-            extreme = max(position["highest_price"] or entry, price)
-            self.state.update_trailing_state(position["id"], highest_price=extreme)
-        else:
-            pnl_pct = (entry - price) / entry * 100
-            extreme = min(position["lowest_price"] or entry, price)
-            self.state.update_trailing_state(position["id"], lowest_price=extreme)
-
-        # Partial take-profits (+10% -> 30%, +20% -> another 30%).
-        if pnl_pct >= 20 and not position["partial_20_closed"]:
-            self._partial_close(position, price, 20)
-            position = self._reload_position(position["id"])
-            if position is None:
-                return
-        elif pnl_pct >= 10 and not position["partial_10_closed"]:
-            self._partial_close(position, price, 10)
-            position = self._reload_position(position["id"])
-            if position is None:
-                return
-
-        # Software trailing stop on the remaining 40%.
-        if position["trailing_active"] or pnl_pct >= TRAILING_ACTIVATION_PERCENT:
-            ts = self.risk.calculate_trailing_stop(entry, price, extreme, side)
-            if ts is not None:
-                hit = (side == "LONG" and price <= ts) or (side == "SHORT" and price >= ts)
-                if hit:
-                    self._close_fully(position, price, "TRAILING_STOP")
-
-    def _reload_position(self, position_id: int):
-        return next(
-            (p for p in self.state.get_active_positions() if p["id"] == position_id),
-            None,
-        )
-
-    def _partial_close(self, position: dict, price: float, level: int) -> None:
-        symbol = position["symbol"]
-        side = position["side"]
-        entry = position["entry_price"]
-
-        # Close 30% of the ORIGINAL position, expressed as % of the current qty.
-        original_qty = position["position_size_usdt"] / entry
-        current_qty = position["quantity"]
-        close_percent = min((PARTIAL_FRACTION * original_qty / current_qty) * 100, 100.0)
-        closed_qty = current_qty * close_percent / 100
-
-        self.client.close_position(symbol, percentage=close_percent)
-
-        remaining_qty = current_qty - closed_qty
-        update = {
-            "symbol": symbol,
-            "quantity": remaining_qty,
-            "position_size_usdt": remaining_qty * entry,
-            f"partial_{level}_closed": True,
+        pos_dict = {
+            **position,
+            "sl": position.get("stop_loss"),
+            "tp": position.get("take_profit"),
         }
-        self.state.save_position(update)
+        pm = self._strategy_for(symbol).position_manager(pos_dict, self.risk)
+        actions = pm.on_bar(price, price, price)
+
+        for action in actions:
+            if action["type"] == "partial_close":
+                self._partial_close(pm, action, price)
+            elif action["type"] == "close_all":
+                self._close_fully(pm, position["id"], action.get("price", price), action["reason"])
+                return  # position fully closed
+
+        # Persist the still-open position state (extreme, flags, remaining qty).
+        self.state.save_position({"symbol": symbol, **pm.state()})
+
+    def _partial_close(self, pm, action: dict, price: float) -> None:
+        symbol = pm.symbol
+        side = pm.side
+        entry = pm.entry_price
+        closed_qty = action["closed_qty"]
+
+        self.client.close_position(symbol, percentage=action["percent"])
 
         pnl = self._pnl(side, entry, price, closed_qty)
-        pnl_percent = self._pnl_percent(side, entry, price, position["leverage"])
+        pnl_percent = self._pnl_percent(side, entry, price, pm.leverage)
         self.state.record_trade(
             {
                 "symbol": symbol,
@@ -337,22 +333,24 @@ class TradingBot:
             }
         )
 
-    def _close_fully(self, position: dict, price: float, reason: str) -> None:
-        symbol = position["symbol"]
-        side = position["side"]
-        entry = position["entry_price"]
-        qty = position["quantity"]
+    def _close_fully(
+        self, pm, position_id: int, price: float, reason: str
+    ) -> None:
+        symbol = pm.symbol
+        side = pm.side
+        entry = pm.entry_price
+        qty = pm.quantity
 
         self.client.close_position(symbol, percentage=100)
         pnl = self._pnl(side, entry, price, qty)
-        self.state.close_position(position["id"], price, reason, pnl)
+        self.state.close_position(position_id, price, reason, pnl)
         self.notifier.send_trade_exit(symbol, side, price, pnl, reason)
         log_trade(
             {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "symbol": symbol, "side": side, "entry_price": entry,
                 "exit_price": price, "quantity": qty, "pnl": pnl,
-                "pnl_percent": self._pnl_percent(side, entry, price, position["leverage"]),
+                "pnl_percent": self._pnl_percent(side, entry, price, pm.leverage),
                 "exit_reason": reason,
             }
         )
@@ -400,6 +398,7 @@ class TradingBot:
 def main() -> None:
     setup_logging()
     config = Config.load()
+    config.validate()
     bot = TradingBot(config)
     bot.run()
 

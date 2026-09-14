@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 
 import pytest
 
@@ -188,7 +189,7 @@ class TestDailySummary:
                          "exit_price": 2, "quantity": 1, "pnl": -4.0,
                          "pnl_percent": -2.0, "exit_reason": "STOP_LOSS"})
 
-        summary = sm.get_daily_summary("2026-09-03")
+        summary = sm.get_daily_summary(datetime.now().strftime("%Y-%m-%d"))
         assert summary["trades_count"] == 2
         assert summary["total_pnl"] == pytest.approx(6.0)
         assert summary["win_rate"] == pytest.approx(0.5)

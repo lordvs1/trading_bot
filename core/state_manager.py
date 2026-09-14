@@ -155,10 +155,13 @@ class StateManager:
         if pos is None:
             raise ValueError(f"No position with id {position_id}")
 
-        # Profit is expressed as a percentage of the margin (notional / leverage)
-        # so that a +X% price move with leverage L shows roughly +X*L%.
-        margin = pos["position_size_usdt"] / pos["leverage"] if pos["leverage"] else 0.0
-        pnl_percent = (pnl / margin * 100.0) if margin else 0.0
+        # pnl_percent = price move % * leverage. Derived from prices rather than
+        # the remaining margin so it stays correct after partial closes.
+        if pos["side"] == "LONG":
+            move = (exit_price - pos["entry_price"]) / pos["entry_price"]
+        else:
+            move = (pos["entry_price"] - exit_price) / pos["entry_price"]
+        pnl_percent = move * pos["leverage"] * 100.0
 
         status = "STOPPED" if exit_reason == "STOP_LOSS" else "CLOSED"
         self._execute(

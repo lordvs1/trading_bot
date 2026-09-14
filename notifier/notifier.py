@@ -102,11 +102,11 @@ class TelegramNotifier:
             f"Цена входа: {_fmt_money(price)}",
             f"Размер: {quantity} {base_asset}",
             f"Стоп-лосс: {_fmt_money(sl)} ({sl_pct:+.0f}%)",
-            f"Тейк-профит 1: {_fmt_money(tp[0])} (+10%) — 30%",
-            f"Тейк-профит 2: {_fmt_money(tp[1])} (+20%) — 30%",
-            "Трейлинг: активация с +15%",
-            f"Риск: {risk_percent * 100:.0f}% от портфеля",
         ]
+        for idx, level in enumerate(tp or [], start=1):
+            pct = (level - price) / price * 100
+            lines.append(f"Тейк-профит {idx}: {_fmt_money(level)} ({pct:+.0f}%)")
+        lines.append(f"Риск: {risk_percent * 100:.0f}% от портфеля")
         return "\n".join(lines)
 
     @staticmethod

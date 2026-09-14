@@ -18,6 +18,7 @@ import time
 from typing import Optional
 
 import pandas as pd
+from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
 
 logger = logging.getLogger("bybit_client")
@@ -73,18 +74,46 @@ class BybitClient:
             raise BybitClientError(f"{context}: {resp.get('retCode')} {resp.get('retMsg')}")
         return resp.get("result", {})
 
+    def _call(self, fn, *args, **kwargs):
+        """Invoke a pybit call, converting transport errors to BybitClientError.
+
+        pybit raises ``FailedRequestError``/``InvalidRequestError`` for
+        non-200 HTTP responses (e.g. 401 on bad credentials) before we ever see
+        a ``retCode``. This wraps them with an actionable message so the bot
+        logs a clear reason instead of a raw library traceback.
+        """
+        try:
+            return fn(*args, **kwargs)
+        except FailedRequestError as exc:
+            raise BybitClientError(self._http_message(exc)) from exc
+        except InvalidRequestError as exc:
+            raise BybitClientError(f"Invalid request: {exc}") from exc
+
+    @staticmethod
+    def _http_message(exc) -> str:
+        status = getattr(exc, "status_code", None)
+        if status == 401:
+            return (
+                "Authentication failed (HTTP 401): invalid API key/secret, or "
+                "BYBIT_TESTNET does not match your API keys"
+            )
+        if status == 403:
+            return "Forbidden (HTTP 403): check API key permissions and IP whitelist"
+        return f"HTTP {status}: {exc}"
+
     # ------------------------------------------------------------------ #
     # Account / market data
     # ------------------------------------------------------------------ #
     def get_balance(self) -> float:
-        resp = self._session.get_wallet_balance(accountType="UNIFIED")
+        resp = self._call(self._session.get_wallet_balance, accountType="UNIFIED")
         self._check(resp, "get_balance")
         account = resp["result"]["list"][0]
         return float(account.get("totalAvailableBalance", 0.0))
 
     def get_klines(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
         bybit_interval = INTERVAL_MAP.get(interval, interval)
-        resp = self._session.get_kline(
+        resp = self._call(
+            self._session.get_kline,
             category="linear",
             symbol=symbol,
             interval=bybit_interval,
@@ -111,12 +140,12 @@ class BybitClient:
         return df[["open", "high", "low", "close", "volume"]]
 
     def get_current_price(self, symbol: str) -> float:
-        resp = self._session.get_tickers(category="linear", symbol=symbol)
+        resp = self._call(self._session.get_tickers, category="linear", symbol=symbol)
         self._check(resp, "get_current_price")
         return float(resp["result"]["list"][0]["lastPrice"])
 
     def get_open_positions(self) -> list[dict]:
-        resp = self._session.get_positions(category="linear", settleCoin="USDT")
+        resp = self._call(self._session.get_positions, category="linear", settleCoin="USDT")
         self._check(resp, "get_open_positions")
 
         positions = []
@@ -135,8 +164,11 @@ class BybitClient:
         return positions
 
     def get_funding_rate(self, symbol: str) -> float:
-        resp = self._session.get_funding_rate_history(
-            category="linear", symbol=symbol, limit=1
+        resp = self._call(
+            self._session.get_funding_rate_history,
+            category="linear",
+            symbol=symbol,
+            limit=1,
         )
         self._check(resp, "get_funding_rate")
         return float(resp["result"]["list"][0]["fundingRate"])
@@ -153,7 +185,8 @@ class BybitClient:
     # Trading
     # ------------------------------------------------------------------ #
     def set_leverage(self, symbol: str, leverage: int) -> None:
-        resp = self._session.set_leverage(
+        resp = self._call(
+            self._session.set_leverage,
             category="linear",
             symbol=symbol,
             buyLeverage=str(leverage),
@@ -193,7 +226,7 @@ class BybitClient:
             params["reduceOnly"] = True
 
         for attempt in range(MAX_ORDER_RETRIES + 1):
-            resp = self._session.place_order(**params)
+            resp = self._call(self._session.place_order, **params)
             ret = resp.get("retCode", -1)
 
             if ret == 0:
@@ -230,5 +263,5 @@ class BybitClient:
         self.place_order(symbol, opposite, qty, "Market", reduce_only=True)
 
     def cancel_all_orders(self, symbol: str) -> None:
-        resp = self._session.cancel_all_orders(category="linear", symbol=symbol)
+        resp = self._call(self._session.cancel_all_orders, category="linear", symbol=symbol)
         self._check(resp, "cancel_all_orders")
