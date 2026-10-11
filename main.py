@@ -44,26 +44,78 @@ class TradingBot:
     def __init__(self, config: Config):
         self.config = config
         self.client = self._make_client(config)
-        strategy_cls = get_strategy(config.strategy)
-        self.strategy = strategy_cls()
-        # Per-symbol strategy instances (honour SYMBOL_OVERRIDES).
-        self.strategies = {
-            sym: strategy_cls({**strategy_cls.default_params(), **config.params_for(sym)})
-            for sym in config.trade_symbols
-        }
+        self._build_strategies()
         self.risk = RiskManager()
         self.state = StateManager("database/trades.db")
-        self.notifier = TelegramNotifier(
-            config.telegram_bot_token, config.telegram_chat_id
-        )
 
         self.running = True
-        self.paused = False
+        self.paused = False        # set on insufficient funds (PAUSE)
+        self.user_paused = False   # set via /pause
+        self._last_balance = None
+        self._last_notified_balance = None
+        self._entry_pm_strategy = {}  # symbol -> strategy used when the position opened
         self._last_alive = time.time()
         self._last_report_date = None
 
+        self.notifier = TelegramNotifier(
+            config.telegram_bot_token, config.telegram_chat_id,
+            handlers=self._handlers(),
+        )
+
+    def _build_strategies(self) -> None:
+        strategy_cls = get_strategy(self.config.strategy)
+        self.strategy = strategy_cls()
+        # Per-symbol strategy instances (honour SYMBOL_OVERRIDES).
+        self.strategies = {
+            sym: strategy_cls({**strategy_cls.default_params(), **self.config.params_for(sym)})
+            for sym in self.config.trade_symbols
+        }
+
+    def _handlers(self) -> dict:
+        return {
+            "status": self._status_snapshot,
+            "positions": lambda: self.state.get_active_positions(),
+            "stats": lambda: self.state.get_daily_summary(date.today().isoformat()),
+            "get_strategy": lambda: self.config.strategy,
+            "set_strategy": self._set_strategy,
+            "set_paused": self._set_paused,
+        }
+
+    def _status_snapshot(self) -> dict:
+        summary = self.state.get_daily_summary(date.today().isoformat())
+        return {
+            "balance": self._last_balance if self._last_balance is not None else 0.0,
+            "mode": self.config.trade_mode,
+            "strategy": self.config.strategy,
+            "symbols": self.config.trade_symbols,
+            "open_positions": len(self.state.get_active_positions()),
+            "daily_pnl": summary["total_pnl"],
+            "paused": self.paused or self.user_paused,
+        }
+
+    def _set_strategy(self, name: str) -> str:
+        try:
+            cls = get_strategy(name)
+        except ValueError:
+            from strategies import STRATEGIES
+            return f"Неизвестная стратегия '{name}'. Доступно: {', '.join(STRATEGIES)}."
+        self.config.strategy = cls.name
+        self._build_strategies()
+        logger.info("Strategy switched to %s", cls.name)
+        return f"Стратегия переключена на '{cls.name}' (применяется к новым сделкам)."
+
+    def _set_paused(self, flag: bool) -> str:
+        self.user_paused = bool(flag)
+        logger.info("User pause set to %s", self.user_paused)
+        return "⏸ Новые входы на паузе." if flag else "▶️ Новые входы возобновлены."
+
     def _strategy_for(self, symbol: str):
         return self.strategies.get(symbol, self.strategy)
+
+    def _position_strategy(self, symbol: str):
+        # Manage an open position with the strategy it was opened with, even if
+        # the active strategy has since been switched.
+        return self._entry_pm_strategy.get(symbol) or self._strategy_for(symbol)
 
     @staticmethod
     def _make_client(config: Config):
@@ -100,6 +152,8 @@ class TradingBot:
             self.notifier.send_error(f"Ошибка при старте: {exc}")
             self._shutdown()
             return
+
+        self._notify_startup()
 
         while self.running:
             try:
@@ -145,6 +199,7 @@ class TradingBot:
             return
 
         balance = self.client.get_balance()
+        self._last_balance = balance
         logger.info("Balance: %.2f USDT", balance)
 
         self._reconcile()
@@ -156,8 +211,28 @@ class TradingBot:
                 logger.exception("Failed processing %s", symbol)
                 self.notifier.send_error(f"Ошибка по {symbol}: {exc}")
 
+        self._maybe_notify_balance(balance)
         self._update_daily_stats()
         self._maybe_send_daily_report()
+
+    def _notify_startup(self) -> None:
+        self.notifier.send_message(
+            "🟢 Бот запущен\n"
+            f"Режим: {self.config.trade_mode}\n"
+            f"Стратегия: {self.config.strategy}\n"
+            f"Символы: {', '.join(self.config.trade_symbols)}\n"
+            f"Риск/сделку: {self.config.max_risk_per_trade * 100:.2f}%"
+        )
+
+    def _maybe_notify_balance(self, balance: float) -> None:
+        """Notify Telegram when the balance moves by more than the threshold."""
+        if self._last_notified_balance is None:
+            self._last_notified_balance = balance
+            return
+        denom = abs(self._last_notified_balance) or 1.0
+        if abs(balance - self._last_notified_balance) / denom >= self.config.balance_change_pct:
+            self.notifier.send_status(self._status_snapshot())
+            self._last_notified_balance = balance
 
     # ------------------------------------------------------------------ #
     # Reconciliation (DB <-> exchange)
@@ -218,6 +293,9 @@ class TradingBot:
             self._manage_position(position)
             return
 
+        if self.user_paused:
+            return  # /pause blocks new entries (existing ones are still managed)
+
         df_h1 = self.client.get_klines(symbol, "H1", 200)
         df_m15 = self.client.get_klines(symbol, "M15", 100)
         funding_rate = self.client.get_funding_rate(symbol)
@@ -274,9 +352,10 @@ class TradingBot:
                 "stop_loss": sl,
             }
         )
+        self._entry_pm_strategy[symbol] = self._strategy_for(symbol)
         self.notifier.send_trade_signal(
             side, symbol, price, quantity, sl, [tp] if tp is not None else [],
-            self.config.max_risk_per_trade,
+            self.config.risk_for(symbol), balance=self._last_balance,
         )
 
     def _manage_position(self, position: dict) -> None:
@@ -288,7 +367,7 @@ class TradingBot:
             "sl": position.get("stop_loss"),
             "tp": position.get("take_profit"),
         }
-        pm = self._strategy_for(symbol).position_manager(pos_dict, self.risk)
+        pm = self._position_strategy(symbol).position_manager(pos_dict, self.risk)
         actions = pm.on_bar(price, price, price)
 
         for action in actions:
@@ -323,7 +402,9 @@ class TradingBot:
                 "exit_reason": "TAKE_PROFIT",
             }
         )
-        self.notifier.send_trade_exit(symbol, side, price, pnl, "TAKE_PROFIT")
+        self.notifier.send_trade_exit(
+            symbol, side, price, pnl, "TAKE_PROFIT", balance=self._last_balance
+        )
         log_trade(
             {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -344,7 +425,10 @@ class TradingBot:
         self.client.close_position(symbol, percentage=100)
         pnl = self._pnl(side, entry, price, qty)
         self.state.close_position(position_id, price, reason, pnl)
-        self.notifier.send_trade_exit(symbol, side, price, pnl, reason)
+        self._entry_pm_strategy.pop(symbol, None)
+        self.notifier.send_trade_exit(
+            symbol, side, price, pnl, reason, balance=self._last_balance
+        )
         log_trade(
             {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -399,6 +483,11 @@ def main() -> None:
     setup_logging()
     config = Config.load()
     config.validate()
+    if not config.telegram_enabled:
+        logger.warning(
+            "Telegram is not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID empty); "
+            "notifications are disabled"
+        )
     bot = TradingBot(config)
     bot.run()
 

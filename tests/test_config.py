@@ -136,6 +136,15 @@ class TestSymbolOverrides:
         assert cfg.symbol_overrides == {}
 
 
+class TestTelegram:
+    def test_enabled_flag(self):
+        assert Config(telegram_bot_token="t", telegram_chat_id="1").telegram_enabled is True
+        assert Config(telegram_bot_token="", telegram_chat_id="1").telegram_enabled is False
+
+    def test_balance_change_pct_default(self):
+        assert Config().balance_change_pct == pytest.approx(0.005)
+
+
 class TestValidate:
     def test_live_requires_keys(self):
         cfg = Config(api_key="", api_secret="")

@@ -245,14 +245,95 @@ out-of-sample годовой темп заметно ниже** (~единицы
 результата — удача периода. Прежде чем рассчитывать на 20%+, смотрите именно
 `OOS`-строки walk-forward, а не in-sample.
 
-## Бэкап и перезапуск (Linux VPS)
+## Telegram-команды
+
+Бот отвечает только на `TELEGRAM_CHAT_ID` владельца:
+
+| Команда | Что делает |
+|---------|------------|
+| `/balance` (`/status`) | баланс, режим, стратегия, открытые позиции, PnL за день |
+| `/positions` | список открытых позиций |
+| `/stats` | дневная статистика (PnL, сделки, win rate) |
+| `/strategy` | показать текущую стратегию |
+| `/strategy range` \| `/strategy trend_ema` | сменить стратегию (runtime) |
+| `/pause` / `/resume` | пауза/возобновление **новых входов** |
+| `/help` | справка |
+
+Плюс автоматически: уведомления о запуске, о входе/выходе (с балансом),
+об ошибках, ежедневный отчёт в 23:50 и сообщение при изменении баланса
+на ≥ `BALANCE_CHANGE_PCT` (по умолч. 0.5%).
+
+> Смена стратегии — **runtime**: после перезапуска берётся `STRATEGY` из `.env`.
+> Уже открытые позиции продолжают вестись стратегией, с которой были открыты.
+
+## Развёртывание на VPS (systemd)
+
+```bash
+# 1. Клонировать и установить зависимости
+cd /opt && sudo git clone <repo> trading_bot && cd trading_bot
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+# 2. Настроить .env (бумажная торговля, ключи Bybit не нужны)
+cp .env.example .env
+nano .env
+#   TRADE_MODE=paper
+#   INITIAL_BALANCE=100
+#   STRATEGY=range
+#   TELEGRAM_BOT_TOKEN=...
+#   TELEGRAM_CHAT_ID=...
+```
+
+Как узнать `TELEGRAM_CHAT_ID`: отправьте боту любое сообщение и откройте
+`https://api.telegram.org/bot<TOKEN>/getUpdates` — в ответе `message.chat.id`.
+
+```bash
+# 3. Быстрая проверка перед автозапуском
+./venv/bin/python main.py   # в Telegram придёт «🟢 Бот запущен»
+```
+
+Создайте юнит `/etc/systemd/system/trading-bot.service`:
+
+```ini
+[Unit]
+Description=Bybit Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/trading_bot
+ExecStart=/opt/trading_bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+User=<your-user>
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now trading-bot
+systemctl status trading-bot
+journalctl -u trading-bot -f        # живые логи
+```
+
+Бэкап по cron (например, ежедневно в 3:00):
+
+```cron
+0 3 * * * /opt/trading_bot/scripts/backup_state.sh >> /opt/trading_bot/logs/backup.log 2>&1
+```
+
+## Бэкап и перезапуск (вручную)
 
 ```bash
 ./scripts/backup_state.sh   # копия trades.db и .env в backups/
-./scripts/restart.sh        # перезапуск процесса
+./scripts/restart.sh        # перезапуск процесса (nohup/PID-файл)
 ```
 
 ## Примечания
 
+- В paper-режиме Bybit-ключи не нужны; данные берутся с публичных эндпоинтов (реальные цены mainnet).
+- Токен Telegram должен опрашиваться только этим процессом (иначе конфликт `getUpdates`).
 - По умолчанию `BYBIT_TESTNET=True`; перед live-торговлей проверьте ключи.
 - При нехватке средств бот переходит в режим `PAUSE` и уведомляет в Telegram.

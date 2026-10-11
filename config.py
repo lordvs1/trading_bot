@@ -32,6 +32,7 @@ class Config:
     initial_balance: float = 1000.0
     size_to_min_lot: bool = False
     risk_hard_cap: float = 0.03
+    balance_change_pct: float = 0.005
     symbol_overrides: dict = field(default_factory=dict)
 
     @property
@@ -89,8 +90,13 @@ class Config:
             initial_balance=float(env.get("INITIAL_BALANCE", "1000")),
             size_to_min_lot=cls._parse_bool(env.get("SIZE_TO_MIN_LOT", "False")),
             risk_hard_cap=float(env.get("RISK_HARD_CAP", "0.03")),
+            balance_change_pct=float(env.get("BALANCE_CHANGE_PCT", "0.005")),
             symbol_overrides=cls._parse_json_dict(env.get("SYMBOL_OVERRIDES", "")),
         )
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
 
     def params_for(self, symbol: str) -> dict:
         """Strategy-parameter overrides for a symbol (excluding the risk key)."""
