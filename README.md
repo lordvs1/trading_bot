@@ -20,11 +20,53 @@
 
 ## Установка
 
+### Чистая Ubuntu (включая 26.04) — одной командой
+
 ```bash
-python -m venv venv
+sudo apt-get update && sudo apt-get install -y git
+git clone <your-repo-url> trading_bot && cd trading_bot
+sudo bash scripts/setup.sh
+```
+
+`scripts/setup.sh` ставит системные пакеты (`git python3 python3-venv python3-pip
+python3-dev build-essential`), (пере)создаёт `venv/`, устанавливает зависимости и
+проверяет импорты. Идемпотентен — можно запускать повторно.
+
+### Ручная установка (Linux/macOS/Windows)
+
+```bash
+sudo apt-get install -y python3 python3-venv python3-pip   # Debian/Ubuntu (Linux)
+python3 -m venv venv
 source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+### Если `python3 -m venv` падает (ensurepip)
+
+На Debian/Ubuntu `venv` ставится отдельным пакетом. Ошибка вида
+`ensurepip is not available` означает, что его нет:
+
+```bash
+sudo apt-get install -y python3-venv python3-pip
+# для конкретной версии, напр. Python 3.14:  sudo apt-get install -y python3.14-venv
+rm -rf venv            # удалить «полусозданный» venv
+python3 -m venv venv
+```
+
+### Если Python слишком новый (3.13/3.14) или нет колёс pandas/numpy
+
+`pip` попытается собрать `pandas`/`numpy` из исходников. Проект рассчитан на
+**Python 3.10–3.12**. Варианты:
+- поставить 3.12 из apt (`sudo apt-get install -y python3.12 python3.12-venv`) и использовать `python3.12 -m venv venv`;
+- либо `uv` (самодостаточный, ставит Python без apt):
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv venv --python 3.12
+  uv pip install -r requirements.txt
+  ```
+
+> На новых Ubuntu `pip install` в систему запрещён (PEP 668, `externally-managed-environment`) — поэтому используйте виртуальное окружение.
+
 
 ## Настройка (.env)
 
@@ -270,9 +312,9 @@ out-of-sample годовой темп заметно ниже** (~единицы
 
 ```bash
 # 1. Клонировать и установить зависимости
+sudo apt-get update && sudo apt-get install -y git
 cd /opt && sudo git clone <repo> trading_bot && cd trading_bot
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
+sudo bash scripts/setup.sh        # ставит venv/pip и зависимости, проверяет импорты
 
 # 2. Настроить .env (бумажная торговля, ключи Bybit не нужны)
 cp .env.example .env
@@ -282,13 +324,16 @@ nano .env
 #   STRATEGY=range
 #   TELEGRAM_BOT_TOKEN=...
 #   TELEGRAM_CHAT_ID=...
+
+# 3. Часовой пояс (для дневного отчёта в 23:50)
+sudo timedatectl set-timezone Europe/Moscow   # или ваш город
 ```
 
 Как узнать `TELEGRAM_CHAT_ID`: отправьте боту любое сообщение и откройте
 `https://api.telegram.org/bot<TOKEN>/getUpdates` — в ответе `message.chat.id`.
 
 ```bash
-# 3. Быстрая проверка перед автозапуском
+# 4. Быстрая проверка перед автозапуском
 ./venv/bin/python main.py   # в Telegram придёт «🟢 Бот запущен»
 ```
 
@@ -305,7 +350,9 @@ WorkingDirectory=/opt/trading_bot
 ExecStart=/opt/trading_bot/venv/bin/python main.py
 Restart=always
 RestartSec=10
-User=<your-user>
+# User running the bot. We deploy as root, so run as root (omit this line).
+# For a dedicated user, create it, chown /opt/trading_bot, and set User=trading.
+# User=root
 
 [Install]
 WantedBy=multi-user.target
